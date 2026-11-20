@@ -3,7 +3,7 @@
 覆盖交付前核对项:
 - 同轮不同完成顺序全部安全(枚举同轮所有子集)
 - 中途续排(部分设备已换后重新规划仍能安全换完)
-- 失败状态:断路 / 环路 / 错出口 的识别与逐跳路径输出
+- 当前不通 / 无法安全换完:首次故障组合去重、次序可复核、故障类型与逐跳路径
 
 内置示例场景(建新路 → 切换 → 拆旧路):
     旧路径 R1→R2→R3→E1,新路径 R1→R4→R5→E2,入口 R1,允许出口 {E1,E2}。
@@ -154,14 +154,14 @@ def test_current_wrong_egress(model):
 
 def test_unreachable_because_of_loop(model):
     """R4 新表指回 R1(配置错误),任何顺序都绕不开环路,报'无法安全换完'。"""
-    topo, routes, reqs = load_example()
-    routes["R4"]["after"] = [{"prefix": "10.1.0.0/16", "next_hop": "10.0.14.1"}]
-    m = build_model(topo, routes, reqs)
+    m = unreachable_loop_model()
     result = compute_plan(m, set())
     assert result.status == "failed"
     assert result.reason == "unreachable"
     assert result.failure_state is not None
-    loops = [f for f in result.failures if f.verdict == VERDICT_LOOP]
+    assert result.first_failures
+    loops = [f for ff in result.first_failures for f in ff.failures
+             if f.verdict == VERDICT_LOOP]
     assert loops, "失败证据里应包含环路"
     # 环路路径的终点应回到路径中已出现过的路由器
     path_routers = [h.router for h in loops[0].path]
@@ -169,18 +169,20 @@ def test_unreachable_because_of_loop(model):
 
 
 def test_blackhole_when_route_missing(model):
-    """R5 新表删掉目标路由,R1 切过去后流量无匹配,报断路。"""
+    """R5 新表删掉目标路由,换到 R1/R4/R5 后流量无匹配,报断路。"""
     topo, routes, reqs = load_example()
     routes["R5"]["after"] = []
     m = build_model(topo, routes, reqs)
     result = compute_plan(m, set())
     assert result.status == "failed"
     assert result.reason == "unreachable"
-    blackholes = [f for f in result.failures if f.verdict == VERDICT_BLACKHOLE]
+    assert result.first_failures
+    blackholes = [f for ff in result.first_failures for f in ff.failures
+                  if f.verdict == VERDICT_BLACKHOLE]
     assert blackholes
-    last = blackholes[0].path[-1]
-    assert last.router == "R5"
-    assert last.matched_prefix is None
+    # 至少有一组是换到 R5 才首次断路(带匹配前缀说明是已匹配但发不出去)
+    assert any(f.path[-1].router == "R5" and f.path[-1].matched_prefix is None
+               for f in blackholes)
 
 
 def test_blackhole_unresolvable_next_hop(model):
@@ -190,9 +192,120 @@ def test_blackhole_unresolvable_next_hop(model):
     m = build_model(topo, routes, reqs)
     result = compute_plan(m, set())
     assert result.status == "failed"
-    blackholes = [f for f in result.failures if f.verdict == VERDICT_BLACKHOLE]
+    assert result.first_failures
+    blackholes = [f for ff in result.first_failures for f in ff.failures
+                  if f.verdict == VERDICT_BLACKHOLE]
     assert blackholes
-    assert blackholes[0].path[-1].matched_prefix == "10.1.0.0/16"
+    assert any(f.path[-1].matched_prefix == "10.1.0.0/16" for f in blackholes)
+
+
+# ------------------------------------------------- 首次故障组合(不可达时)
+
+def first_failure_of_order(model, start, order):
+    """模拟逐台换表,返回(首次故障的已换集合, 触发设备)或 None(全部换完仍安全)。"""
+    state = set(start)
+    for name in order:
+        state.add(name)
+        if state_failures(model, frozenset(state)):
+            return frozenset(state), name
+    return None
+
+
+def unreachable_loop_model():
+    topo, routes, reqs = load_example()
+    routes["R4"]["after"] = [{"prefix": "10.1.0.0/16", "next_hop": "10.0.14.1"}]
+    return build_model(topo, routes, reqs)
+
+
+def test_first_failures_are_unique_and_consistent(model):
+    """每个首次故障组合只出现一次,且其次序确实在最后一台换表时首次违约。"""
+    m = unreachable_loop_model()
+    result = compute_plan(m, set())
+    assert result.status == "failed" and result.reason == "unreachable"
+    assert len(result.first_failures) > 1, "应列出多个不同的首次故障组合,而非单一状态"
+
+    seen = set()
+    for ff in result.first_failures:
+        key = tuple(ff.switched)
+        assert key not in seen, f"组合重复: {key}"
+        seen.add(key)
+        # 次序的最后一台就是触发设备,次序走完后正好是报告的组合
+        assert ff.order[-1] == ff.trigger
+        assert ff.switched == sorted(set(result.switched) | set(ff.order))
+        # 触发前一状态安全,触发后违约,故障项与重新仿真的结果一致
+        prefix = set(result.switched) | set(ff.order[:-1])
+        assert state_failures(m, frozenset(prefix)) == []
+        state = frozenset(prefix | {ff.trigger})
+        assert state_failures(m, state)
+        assert [f.as_dict() for f in ff.failures] == [
+            f.as_dict() for f in state_failures(m, state)]
+        # 组内故障路径可达且类型有效
+        for f in ff.failures:
+            assert f.verdict in {VERDICT_BLACKHOLE, VERDICT_LOOP, VERDICT_WRONG_EGRESS}
+            assert f.path and f.path[0].router == f.ingress
+
+
+def test_first_failure_groups_cover_every_permutation():
+    """穷举全部逐台次序,其首次故障集合应恰好等于报告的组集合。"""
+    m = unreachable_loop_model()
+    result = compute_plan(m, set())
+    reported = {frozenset(ff.switched) for ff in result.first_failures}
+    observed = set()
+    for order in itertools.permutations(m.routers):
+        hit = first_failure_of_order(m, set(), order)
+        assert hit is not None, f"次序 {order} 声称能安全换完,与不可达结论矛盾"
+        observed.add(hit[0])
+    assert observed == reported
+    # 每条报告次序重新模拟,首次故障正是该组
+    for ff in result.first_failures:
+        state = set(result.switched)
+        for name in ff.order:
+            state.add(name)
+            if state_failures(m, frozenset(state)):
+                assert frozenset(state) == frozenset(ff.switched)
+                break
+
+
+def test_first_failure_when_full_state_unsafe(model):
+    """全换完也不通时仍按首次故障报告,而不是只报最终满状态。"""
+    topo, routes, reqs = load_example()
+    routes["R5"]["after"] = []  # 满状态断路;但多数次序更早就会断
+    m = build_model(topo, routes, reqs)
+    result = compute_plan(m, set())
+    assert result.status == "failed" and result.reason == "unreachable"
+    assert state_failures(m, frozenset(m.routers))
+    assert result.first_failures
+    reported = {frozenset(ff.switched) for ff in result.first_failures}
+    observed = {first_failure_of_order(m, set(), oth)[0]
+                for oth in itertools.permutations(m.routers)}
+    assert observed == reported
+    assert frozenset(m.routers) not in reported  # R5 不是首次故障点
+
+
+def test_unreachable_with_start_switched(model):
+    """勾选部分已换设备后续排,首次故障组合必须包含这些起点设备。"""
+    m = unreachable_loop_model()
+    start = {"R4", "R5"}
+    result = compute_plan(m, start)
+    assert result.status == "failed" and result.reason == "unreachable"
+    assert result.switched == ["R4", "R5"]
+    assert result.first_failures
+    for ff in result.first_failures:
+        assert set(result.switched) <= set(ff.switched)
+        assert state_failures(m, frozenset(ff.switched))
+        assert state_failures(m, frozenset(set(ff.switched) - {ff.trigger})) == []
+
+
+def test_current_unsafe_keeps_single_current_report(model):
+    """当前已不通时只报当前故障,不混入首次故障组合。"""
+    topo, routes, reqs = load_example()
+    reqs["requirements"][0]["allowed_egress"] = ["E2"]
+    m = build_model(topo, routes, reqs)
+    result = compute_plan(m, set())
+    assert result.reason == "current_unsafe"
+    assert result.first_failures == []
+    assert result.failure_state == []
+    assert result.failures
 
 
 # --------------------------------------------------------------- 等价类划分

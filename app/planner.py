@@ -324,6 +324,27 @@ class Failure:
         }
 
 
+@dataclass
+class FirstFailure:
+    """一种"首次破坏保通"的已换设备组合。
+
+    同一组合在不同次序下首次故障时的转发结果相同(只取决于已换集合),
+    因此每组只报一次;order 是走到该组合的一条切换次序,最后一台即触发故障的换表。
+    """
+    switched: list[str]        # 首次故障时的已换设备(完整集合,已排序)
+    order: list[str]           # 从当前已换集合出发的逐台换表次序(含触发故障的一台)
+    trigger: str               # order 的最后一台
+    failures: list[Failure]
+
+    def as_dict(self) -> dict:
+        return {
+            "switched": self.switched,
+            "order": self.order,
+            "trigger": self.trigger,
+            "failures": [f.as_dict() for f in self.failures],
+        }
+
+
 def state_failures(model: Model, state: frozenset[str], max_failures: int = 20) -> list[Failure]:
     """列出该状态下所有保通要求的违约项(空列表 = 安全)。"""
     failures: list[Failure] = []
@@ -351,6 +372,8 @@ class PlanResult:
     failure_state: list[str] | None
     failures: list[Failure]
     message: str
+    # 仅 unreachable 时有值:所有"首次破坏保通"的已换设备组合,每组一条次序
+    first_failures: list[FirstFailure] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -361,6 +384,7 @@ class PlanResult:
             "failure_state": self.failure_state,
             "failures": [f.as_dict() for f in self.failures],
             "message": self.message,
+            "first_failures": [ff.as_dict() for ff in self.first_failures],
         }
 
 
@@ -446,29 +470,63 @@ def compute_plan(model: Model, switched: set[str]) -> PlanResult:
         return PlanResult(
             status="ok", reason=None, rounds=rounds,
             switched=names(start), failure_state=None, failures=[],
-            message=f"共 {len(rounds)} 轮;同轮内任意完成顺序均安全。",
+            message=(f"共 {len(rounds)} 轮;同轮内任意完成顺序均安全。" if rounds
+                     else "全部设备均已换表,无需再排轮次。"),
         )
 
-    # 4) 不可达:找一个"挡路"的失败状态作为证据
-    #    在可达安全集合的边界上,找加一个路由器就违约的状态
-    frontier_fail: int | None = None
-    if not safe[full]:
-        frontier_fail = full  # 全部换完本身就不安全
-    else:
-        for m in sorted(prev, key=lambda x: -bin(x).count("1")):
-            for i in range(n):
-                bit = 1 << i
-                if not m & bit and not safe[m | bit]:
-                    frontier_fail = m | bit
-                    break
-            if frontier_fail is not None:
-                break
-    if frontier_fail is None:  # 理论兜底
-        frontier_fail = full
+    # 4) 不可达:列出所有"首次破坏保通"的已换设备组合,每组给一条到首次故障为止的次序
+    #    对每个安全状态 m,若把某一台未换设备 x 换掉后开始违约,则 m|x 就是一个首次故障组合。
+    #    一条次序 = 一条从 start 到 m 的安全路径(逐台)+ x,故 m|x 只要可达就一定排得出。
+    #    不同次序可能首次破坏在同一组合,用集合去重,保证每组只出现一次。
+    def safe_path_to(mask: int) -> list[str]:
+        """沿 BFS 父链给出从 start 逐台走到 mask 的一条安全次序。
+
+        prev[sup] 记录的是经 subcube_safe 验证的一步,该步内任意中间状态都安全,
+        因此按父链倒推、每步内按名字排序,得到的逐台次序全程安全。
+        """
+        steps: list[list[int]] = []
+        cur = mask
+        while cur != start:
+            parent, _ = prev[cur]
+            added = [1 << i for i in range(n) if cur & (1 << i) and not parent & (1 << i)]
+            added.sort(key=lambda b: routers[b.bit_length() - 1])
+            steps.append(added)
+            cur = parent
+        order: list[str] = []
+        for added in reversed(steps):
+            order.extend(routers[b.bit_length() - 1] for b in added)
+        return order
+
+    first: dict[int, FirstFailure] = {}
+    for m in prev:  # prev 只含从 start 可达的安全状态
+        if m == full:
+            continue
+        for i in range(n):
+            bit = 1 << i
+            if m & bit or safe[m | bit]:
+                continue
+            ff_mask = m | bit
+            name = routers[i]
+            order = safe_path_to(m) + [name]
+            first.setdefault(ff_mask, FirstFailure(
+                switched=names(ff_mask), order=order, trigger=name,
+                failures=failures_of(ff_mask),
+            ))
+
+    first_failures = sorted(first.values(), key=lambda ff: (len(ff.switched), ff.switched))
+    if first_failures:
+        message = ("从当前状态出发,逐台换表时首次破坏保通的组合共 "
+                   f"{len(first_failures)} 组(每组只列一次)。"
+                   "下列次序都在最后一台换表后首次违约;"
+                   "不存在能逐台安全换完全部设备的次序。")
+    else:  # 理论兜底:所有单步都安全却仍到不了满状态(不应发生)
+        message = "从当前状态出发,不存在能逐台安全换完全部设备的顺序。"
+
     return PlanResult(
         status="failed", reason="unreachable", rounds=[],
-        switched=names(start), failure_state=names(frontier_fail),
-        failures=failures_of(frontier_fail),
-        message="从当前状态出发,不存在能安全换完全部设备的顺序;"
-                "下面给出一个必然经过的失败状态作为证据。",
+        switched=names(start),
+        # 兼容旧字段:取组数最少的那一组作为代表;完整清单见 first_failures
+        failure_state=first_failures[0].switched if first_failures else None,
+        failures=list(first_failures[0].failures) if first_failures else [],
+        message=message, first_failures=first_failures,
     )

@@ -46,7 +46,7 @@
 <body>
 <header>
   <h1>备份专网出口切换 · 换表轮次规划器</h1>
-  <p>上传拓扑与换版前后静态路由表(≤8 台),给出轮次最少的整表切换计划;同轮任意完成顺序均保证保通要求。</p>
+  <p>上传拓扑与换版前后静态路由表(≤8 台),给出轮次最少的整表切换计划;同轮任意完成顺序均保证保通要求。排不出保通方案时,按「逐台换表的首次故障组合」逐组给出次序与故障路径。</p>
 </header>
 <main>
   <section>
@@ -141,6 +141,17 @@ function pathTable(path, verdict) {
   return `<table><tr><th>跳</th><th>路由器</th><th>匹配前缀</th><th>下一跳</th><th>发往</th></tr>${rows}</table>`;
 }
 
+function failureCard(f) {
+  return `
+    <div class="failcard">
+      <div>要求:<b>${esc(f.requirement)}</b> · 入口 <span class="mono">${esc(f.ingress)}</span>
+        · 目标地址 <span class="mono">${esc(f.target_address)}</span>
+        · 故障类型 <span class="tag ${f.verdict}">${esc(f.verdict_zh)}</span>
+        ${f.egress ? ` · 实际出口 <span class="mono">${esc(f.egress)}</span>` : ''}</div>
+      ${pathTable(f.path, f.verdict)}
+    </div>`;
+}
+
 $('run').addEventListener('click', async () => {
   const out = $('result'), sec = $('resultSec');
   sec.style.display = 'block';
@@ -157,32 +168,48 @@ $('run').addEventListener('click', async () => {
     return;
   }
   out.innerHTML = '<p class="hint">计算中……</p>';
-  const resp = await fetch('/api/plan', {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
-  });
-  const d = await resp.json();
+  let d, resp;
+  try {
+    resp = await fetch('/api/plan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    d = await resp.json();
+  } catch (e) {
+    out.innerHTML = `<div class="err">请求失败:${esc(e.message)}</div>`;
+    return;
+  }
   if (!resp.ok) { out.innerHTML = `<div class="err">输入校验失败:${esc(d.detail ?? resp.status)}</div>`; return; }
 
   if (d.status === 'ok') {
     const rounds = d.rounds.map((r, i) =>
       `<div class="round"><b>第 ${i + 1} 轮</b>:${r.map(esc).join('、')}
        <span class="tag ok">同轮任意完成顺序均安全</span></div>`).join('');
-    out.innerHTML = `<div class="okbox"><b>计划生成成功</b> — ${esc(d.message)}
+    out.innerHTML = `<div class="okbox"><b>有保通方案 · 最少 ${d.rounds.length} 轮</b> — ${esc(d.message)}
       ${d.switched.length ? `<div>已换设备(续排起点):${d.switched.map(esc).join('、')}</div>` : ''}
-      ${rounds}</div>`;
-  } else {
-    const reasonZh = d.reason === 'current_unsafe' ? '当前不通' : '无法安全换完';
-    const fails = d.failures.map(f => `
-      <div class="failcard">
-        <div>要求:<b>${esc(f.requirement)}</b> · 入口 <span class="mono">${esc(f.ingress)}</span>
-          · 目标地址 <span class="mono">${esc(f.target_address)}</span>
-          · 结论 <span class="tag ${f.verdict}">${esc(f.verdict_zh)}</span>
-          ${f.egress ? ` · 实际出口 <span class="mono">${esc(f.egress)}</span>` : ''}</div>
-        ${pathTable(f.path, f.verdict)}
-      </div>`).join('');
-    out.innerHTML = `<div class="badbox"><b>失败状态:${reasonZh}</b> — ${esc(d.message)}
-      <div>失败状态下的已换设备:${d.failure_state.length ? d.failure_state.map(esc).join('、') : '(无)'}</div></div>
+      ${d.rounds.length ? rounds : '<div>全部设备均已换表,无需再排轮次。</div>'}</div>`;
+  } else if (d.reason === 'current_unsafe') {
+    const fails = d.failures.map(f => failureCard(f)).join('');
+    out.innerHTML = `<div class="badbox"><b>当前不通</b> — ${esc(d.message)}
+      <div>当前已换设备:${d.failure_state.length ? d.failure_state.map(esc).join('、') : '(无)'}</div>
+      <div class="hint">这是换表前的现状故障;先修复到满足保通要求,才能开始排换表次序。</div></div>
       ${fails}`;
+  } else {
+    const groups = d.first_failures.map((ff, i) => {
+      const steps = ff.order.map((r, k) =>
+        `<span class="mono">${esc(r)}</span>${k === ff.order.length - 1 ? '(触发)' : ''}`).join(' → ');
+      const shown = ff.failures.slice(0, 8);
+      const fails = shown.map(f => failureCard(f)).join('');
+      const more = ff.failures.length > shown.length
+        ? `<p class="hint">另有 ${ff.failures.length - shown.length} 条故障记录未展开。</p>` : '';
+      return `<div class="failcard">
+        <div><b>首次故障组合 ${i + 1}</b>:已换设备 <span class="mono">${ff.switched.map(esc).join('、') || '(无)'}</span>
+          <span class="hint">(共 ${ff.switched.length} 台)</span></div>
+        <div style="margin-top:4px">切换次序(到首次故障为止):${steps}</div>
+        ${fails}${more}</div>`;
+    }).join('');
+    out.innerHTML = `<div class="badbox"><b>无法安全换完</b> — ${esc(d.message)}
+      <div>已换设备(续排起点):${d.switched.length ? d.switched.map(esc).join('、') : '(无)'}</div></div>
+      ${groups || '<p class="hint">(没有可报告的首次故障组合)</p>'}`;
   }
 });
 
